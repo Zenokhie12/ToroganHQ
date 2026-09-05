@@ -1,0 +1,79 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // One extra document read per rule evaluation — cheap in practice
+    // (client-side role caching in Pinia keeps the *app* from re-reading
+    // this), but it does count against the 50k reads/day Spark quota, so
+    // don't call this more than once per rule.
+    function callerDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isApprovedStaff() {
+      return isSignedIn()
+        && callerDoc().role in ['officer', 'management']
+        && callerDoc().status == 'approved';
+    }
+
+    function isManagement() {
+      return isSignedIn()
+        && callerDoc().role == 'management'
+        && callerDoc().status == 'approved';
+    }
+
+    match /users/{userId} {
+      // Own profile (any status/role) or any approved staff member.
+      allow read: if isSignedIn() && (request.auth.uid == userId || isApprovedStaff());
+
+      // Self-registration only, and only into the two self-serve roles.
+      // Officers land 'pending'; students land 'approved' immediately since
+      // there is no approval gate for residents. Nobody can create their
+      // own doc as 'management', and merits/demerits must start at zero.
+      allow create: if isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.role in ['student', 'officer']
+        && request.resource.data.status == (request.resource.data.role == 'student' ? 'approved' : 'pending')
+        && request.resource.data.merits == 0
+        && request.resource.data.demerits == 0
+        && request.resource.data.penalties == 0
+        && request.resource.data.standing == 'good';
+
+      // Students are strictly read-only, even on their own doc: the whole
+      // point of a client-only backend is that nobody but staff moves the
+      // merit/demerit numbers. Management can edit anything (approvals,
+      // role changes, room reassignment); officers are limited to exactly
+      // the standing fields, and can't touch their own doc's standing.
+      allow update: if isManagement()
+        || (
+          isApprovedStaff()
+          && request.auth.uid != userId
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['merits', 'demerits', 'penalties', 'standing', 'updatedAt'])
+        );
+
+      allow delete: if isManagement();
+    }
+
+    match /rooms/{roomId} {
+      allow read: if isApprovedStaff();
+      allow write: if isManagement();
+    }
+
+    match /applications/{applicationId} {
+      // Public application form: anyone may submit, nobody but Management
+      // may read submissions back (so guests can't browse each other's
+      // applications) or triage them.
+      allow create: if request.resource.data.status == 'pending'
+        && request.resource.data.reviewedBy == null
+        && request.resource.data.keys().hasAll(['fullName', 'email', 'submittedAt']);
+      allow read, update, delete: if isManagement();
+    }
+  }
+}
